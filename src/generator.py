@@ -20,14 +20,15 @@ _client = None
 def get_client() -> genai.Client:
     global _client
     if _client is None:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if api_key:
-            _client = genai.Client(api_key=api_key)
+        gemini_key = os.environ.get("GEMINI_API_KEY")
+        vertex_key = os.environ.get("VERTEX_API_KEY")
+        if gemini_key:
+            _client = genai.Client(api_key=gemini_key)
+        elif vertex_key:
+            _client = genai.Client(vertexai=True, api_key=vertex_key)
         else:
-            _client = genai.Client(
-                vertexai=True,
-                project=os.environ["VERTEX_PROJECT_ID"],
-                location=os.environ.get("VERTEX_LOCATION", "us-central1"),
+            raise RuntimeError(
+                "No Gemini credentials: set GEMINI_API_KEY or VERTEX_API_KEY in .env"
             )
     return _client
 
