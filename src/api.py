@@ -2,11 +2,12 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from src.ask import cited_sources
 from src.documents import SUPPORTED_TYPES
-from src.generator import generate_answer
+from src.generator import GENERATOR_MODEL, LLM_PROVIDER, generate_answer
 from src.pipeline_run import build_library, retrieve
 
 DOCS_DIR = "eval_docs"
@@ -30,18 +31,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Multimodal RAG", lifespan=lifespan)
 
+
 class Question(BaseModel):
     question: str
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
+    ready = library.get("passages", 0) > 0
+    body = {
+        "status": "ok" if ready else "not ready",
+        "llm": LLM_PROVIDER,
+        "model": GENERATOR_MODEL,
         "documents": library.get("files", []),
         "passages": library.get("passages", 0),
         "images": len(library.get("images", [])),
     }
+    return JSONResponse(body, status_code=200 if ready else 503)
+
+
 @app.post("/ask")
 def ask(body: Question):
     selected = retrieve(body.question, library["hybrid"], use_reranking=True)

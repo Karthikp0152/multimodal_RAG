@@ -7,7 +7,7 @@ from google.genai import types
 from PIL import Image
 from pydantic import BaseModel
 
-from src.generator import GENERATOR_MODEL, get_client
+from src.generator import GENERATOR_MODEL, LLM_PROVIDER, get_client, image_part
 
 CACHE_PATH = os.path.join(".cache", "image_text.json")
 
@@ -27,6 +27,13 @@ READ_PROMPT = (
 class ImageContent(BaseModel):
     kind: str
     content: str
+
+
+# Gemini enforces the JSON shape with response_schema; for ASU we ask for it in the prompt.
+JSON_INSTRUCTION = (
+    '\n\nReply with only a JSON object, no other text: {"kind": "text" | "description" | '
+    '"decorative", "content": "..."}'
+)
 
 
 _cache: dict[str, dict] | None = None
@@ -69,6 +76,24 @@ def read_image(png_bytes: bytes) -> dict:
     if key in cache:
         return cache[key]
 
+    if LLM_PROVIDER == "asu":
+        result = _read_image_asu(png_bytes)
+    else:
+        result = _read_image_gemini(png_bytes)
+
+    cache[key] = result
+    _save_cache()
+    return result
+
+
+def _clean(kind: str | None, content: str | None) -> dict:
+    """Keep only the three known kinds; anything else counts as decorative."""
+    if kind not in ("text", "description", "decorative"):
+        return {"kind": "decorative", "content": ""}
+    return {"kind": kind, "content": (content or "").strip()}
+
+
+def _read_image_gemini(png_bytes: bytes) -> dict:
     response = get_client().models.generate_content(
         model=GENERATOR_MODEL,
         contents=[types.Part.from_bytes(data=png_bytes, mime_type="image/png"), READ_PROMPT],
@@ -79,11 +104,24 @@ def read_image(png_bytes: bytes) -> dict:
         ),
     )
     parsed = response.parsed
-    if parsed is None or parsed.kind not in ("text", "description", "decorative"):
-        result = {"kind": "decorative", "content": ""}
-    else:
-        result = {"kind": parsed.kind, "content": parsed.content.strip()}
+    if parsed is None:
+        return _clean(None, None)
+    return _clean(parsed.kind, parsed.content)
 
-    cache[key] = result
-    _save_cache()
-    return result
+
+def _read_image_asu(png_bytes: bytes) -> dict:
+    response = get_client().chat.completions.create(
+        model=GENERATOR_MODEL,
+        temperature=0.0,
+        messages=[{
+            "role": "user",
+            "content": [image_part(png_bytes), {"type": "text", "text": READ_PROMPT + JSON_INSTRUCTION}],
+        }],
+    )
+    text = response.choices[0].message.content or ""
+    start, end = text.find("{"), text.rfind("}")
+    try:
+        parsed = ImageContent.model_validate_json(text[start:end + 1])
+    except Exception:
+        return _clean(None, None)
+    return _clean(parsed.kind, parsed.content)
