@@ -1,3 +1,4 @@
+import base64
 import os
 import random
 import time
@@ -6,10 +7,20 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import errors
 from google.genai import types
+from openai import APIConnectionError, APIStatusError, OpenAI
 
 load_dotenv()
 
-GENERATOR_MODEL = "gemini-2.5-flash"
+# Which LLM answers: "gemini" (default) or "asu". Set LLM_PROVIDER in .env.
+LLM_PROVIDER = (os.environ.get("LLM_PROVIDER") or "gemini").strip().lower()
+if LLM_PROVIDER not in ("gemini", "asu"):
+    raise ValueError(f"LLM_PROVIDER must be 'gemini' or 'asu', got {LLM_PROVIDER!r}")
+
+GEMINI_MODEL = "gemini-2.5-flash"
+ASU_RC_MODEL = os.environ.get("ASU_RC_MODEL", "muse-glimmer-30b")
+ASU_RC_BASE_URL = os.environ.get("ASU_RC_BASE_URL", "https://openai.rc.asu.edu/v1")
+GENERATOR_MODEL = ASU_RC_MODEL if LLM_PROVIDER == "asu" else GEMINI_MODEL
+
 NO_ANSWER = "You do not have enough information."
 MAX_RETRIES = 5
 RETRYABLE_STATUS = (429, 500, 502, 503, 504)
@@ -17,20 +28,29 @@ RETRYABLE_STATUS = (429, 500, 502, 503, 504)
 _client = None
 
 
-def get_client() -> genai.Client:
+def get_client():
+    """Return the client for the configured provider (created once, then reused)."""
     global _client
     if _client is None:
-        gemini_key = os.environ.get("GEMINI_API_KEY")
-        vertex_key = os.environ.get("VERTEX_API_KEY")
-        if gemini_key:
-            _client = genai.Client(api_key=gemini_key)
-        elif vertex_key:
-            _client = genai.Client(vertexai=True, api_key=vertex_key)
-        else:
-            raise RuntimeError(
-                "No Gemini credentials: set GEMINI_API_KEY or VERTEX_API_KEY in .env"
-            )
+        _client = _make_asu_client() if LLM_PROVIDER == "asu" else _make_gemini_client()
     return _client
+
+
+def _make_gemini_client() -> genai.Client:
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    vertex_key = os.environ.get("VERTEX_API_KEY")
+    if gemini_key:
+        return genai.Client(api_key=gemini_key)
+    if vertex_key:
+        return genai.Client(vertexai=True, api_key=vertex_key)
+    raise RuntimeError("No Gemini credentials: set GEMINI_API_KEY or VERTEX_API_KEY in .env")
+
+
+def _make_asu_client() -> OpenAI:
+    api_key = os.environ.get("ASU_RC_API_KEY")
+    if not api_key:
+        raise RuntimeError("No ASU credentials: set ASU_RC_API_KEY in .env")
+    return OpenAI(base_url=ASU_RC_BASE_URL, api_key=api_key)
 
 
 HEADING_NOTE = (
@@ -104,8 +124,14 @@ def generate_answer(
         question, chunks, section_headings=section_headings, subject=subject,
         source_tags=source_tags, image_labels=[label for label, _ in images] if images else None,
     )
+    if LLM_PROVIDER == "asu":
+        return _generate_asu(prompt, images or [], temperature)
+    return _generate_gemini(prompt, images or [], temperature)
+
+
+def _generate_gemini(prompt: str, images: list[tuple[str, bytes]], temperature: float) -> str:
     contents = [prompt]
-    for label, png in images or []:
+    for label, png in images:
         contents += [label, types.Part.from_bytes(data=png, mime_type="image/png")]
     config = types.GenerateContentConfig(temperature=temperature)
 
@@ -120,6 +146,39 @@ def generate_answer(
             time.sleep(2**attempt + random.random())
             continue
         text = getattr(response, "text", None)
+        return text.strip() if text else NO_ANSWER
+
+    return NO_ANSWER
+
+
+def image_part(png: bytes) -> dict:
+    """An image in OpenAI chat format (base64 data URL)."""
+    data = base64.b64encode(png).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}}
+
+
+def _generate_asu(prompt: str, images: list[tuple[str, bytes]], temperature: float) -> str:
+    if images:
+        content = [{"type": "text", "text": prompt}]
+        for label, png in images:
+            content += [{"type": "text", "text": label}, image_part(png)]
+    else:
+        content = prompt
+    messages = [{"role": "user", "content": content}]
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = get_client().chat.completions.create(
+                model=GENERATOR_MODEL, messages=messages, temperature=temperature
+            )
+        except (APIStatusError, APIConnectionError) as exc:
+            status = getattr(exc, "status_code", None)
+            retryable = isinstance(exc, APIConnectionError) or status in RETRYABLE_STATUS
+            if not retryable or attempt == MAX_RETRIES - 1:
+                raise
+            time.sleep(2**attempt + random.random())
+            continue
+        text = response.choices[0].message.content
         return text.strip() if text else NO_ANSWER
 
     return NO_ANSWER
