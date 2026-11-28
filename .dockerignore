@@ -1,0 +1,18 @@
+# Secrets
+.env
+
+# Local tools and environments
+venv/
+.git/
+.gitignore
+.vscode/
+.DS_Store
+__pycache__/
+*.pyc
+
+# Not needed for running the app
+data/
+*.log
+eval_logs/
+results/
+README.md
